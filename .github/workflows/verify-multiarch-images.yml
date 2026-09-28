@@ -17,16 +17,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Enable non-native architectures
-        run: docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install all
-
-      - name: Create Buildx builder
+      - name: Build all architectures with the Cloud Build tool image
         run: |
-          docker buildx create --name csi-validation --driver docker-container --bootstrap --use
-          docker buildx inspect --bootstrap
-
-      - name: Build all architecture images without pushing
-        run: make docker-build-all CORE_DRIVER_IMG=ibm-vpc-block-csi-driver-validation TAG=pr-${GITHUB_SHA:0:12}
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            -e DOCKER_CLI_EXPERIMENTAL=enabled \
+            registry.k8s.io/releng/gcb-docker-gcloud:v20260806 \
+            make docker-build-all CORE_DRIVER_IMG=ibm-vpc-block-csi-driver-validation TAG=pr-${GITHUB_SHA:0:12}
 
       - name: Verify image platforms
         run: |
