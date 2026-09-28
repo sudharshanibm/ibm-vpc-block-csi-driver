@@ -19,10 +19,13 @@ jobs:
 
       - name: Build all architectures with the Cloud Build tool image
         run: |
+          mkdir -p "$RUNNER_TEMP/docker-config"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$RUNNER_TEMP/docker-config:/tmp/docker-config" \
             -w /workspace \
+            -e DOCKER_CONFIG=/tmp/docker-config \
             -e DOCKER_CLI_EXPERIMENTAL=enabled \
             registry.k8s.io/releng/gcb-docker-gcloud:v20260806 \
             make docker-build-all CORE_DRIVER_IMG=ibm-vpc-block-csi-driver-validation TAG=pr-${GITHUB_SHA:0:12}
