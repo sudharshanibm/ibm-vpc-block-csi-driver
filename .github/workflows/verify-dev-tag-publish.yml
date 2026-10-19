@@ -1,0 +1,149 @@
+name: Validate dev-tag image publishing
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Dev tag pointing directly at the PR commit, in refs/tags/<tag> form'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-and-verify:
+    if: github.repository == 'sudharshanibm/ibm-vpc-block-csi-driver'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IMAGE: ghcr.io/sudharshanibm/ibm-vpc-block-csi-driver-dev-validation
+      SOURCE_REF: ${{ inputs.source_ref }}
+      PR_COMMIT: b1beddec4d9bb105e5ca1f3150310afb3a79b1ef # pragma: allowlist secret - public Git commit SHA
+    steps:
+      - name: Check out the dev tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Verify dev tag points directly at PR 280
+        run: |
+          [[ "$SOURCE_REF" == refs/tags/* ]]
+          source_tag=${SOURCE_REF#refs/tags/}
+          [[ "$source_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.multiarch\.fork\.[0-9]+$ ]]
+          source_commit=$(git rev-parse HEAD)
+          test "$source_commit" = "$PR_COMMIT"
+          echo "Building dev tag $source_tag at PR commit $source_commit"
+          echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
+          echo "BUILD_TAG=v$(date -u +%Y%m%d)-$source_tag" >> "$GITHUB_ENV"
+          echo "DEV_ALIAS_TAG=$source_tag" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/devtag-docker-config" >> "$GITHUB_ENV"
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish with the proposed Cloud Build tool image
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$DOCKER_CONFIG:/tmp/docker-config" \
+            -w /workspace \
+            -e DOCKER_CONFIG=/tmp/docker-config \
+            -e DOCKER_CLI_EXPERIMENTAL=enabled \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/workspace \
+            registry.k8s.io/releng/gcb-docker-gcloud:v20260806 \
+            make release-staging \
+              CORE_DRIVER_IMG="$IMAGE" \
+              TAG="$BUILD_TAG" \
+              PULL_BASE_REF="$DEV_ALIAS_TAG" \
+              RELEASE_ALIAS_TAG="$DEV_ALIAS_TAG"
+
+      - name: Restore runner access to container-created Docker configuration
+        if: always() && env.DOCKER_CONFIG != ''
+        run: sudo chown -R "$(id -u):$(id -g)" "$DOCKER_CONFIG"
+
+      - name: Verify published image configurations and both manifests
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          image = os.environ['IMAGE']
+          build_tag = os.environ['BUILD_TAG']
+          alias = os.environ['DEV_ALIAS_TAG']
+          expected = {'linux/amd64', 'linux/arm64', 'linux/ppc64le', 'linux/s390x'}
+          errors = []
+          rows = []
+          manifests = []
+
+          def inspect(ref, image_config=False):
+              args = ['docker', 'buildx', 'imagetools', 'inspect']
+              args += ['--format', '{{json .Image}}'] if image_config else ['--raw']
+              return json.loads(subprocess.check_output(args + [ref], text=True))
+
+          for arch in ('amd64', 'arm64', 'ppc64le', 's390x'):
+              ref = f'{image}:{arch}-{build_tag}'
+              config = inspect(ref, image_config=True)
+              actual = f"{config.get('os')}/{config.get('architecture')}"
+              rows.append(f'| `{arch}-{build_tag}` | `{actual}` |')
+              print(f'{ref}: image configuration = {actual}', flush=True)
+              if actual != f'linux/{arch}':
+                  errors.append(f'{ref}: expected linux/{arch}, got {actual}')
+
+          for tag in (build_tag, alias):
+              ref = f'{image}:{tag}'
+              manifest = inspect(ref)
+              manifests.append(manifest)
+              actual = {
+                  f"{m['platform'].get('os')}/{m['platform'].get('architecture')}"
+                  for m in manifest.get('manifests', [])
+              }
+              if not actual:
+                  config = inspect(ref, image_config=True)
+                  actual = {f"{config.get('os')}/{config.get('architecture')}"}
+              platforms = ', '.join(sorted(actual))
+              print(f'{ref}: published platforms = {platforms}', flush=True)
+              rows.append(f'| `{tag}` | `{platforms}` |')
+              if actual != expected:
+                  errors.append(f'{ref}: expected {sorted(expected)}, got {sorted(actual)}')
+
+          if manifests[0] != manifests[1]:
+              errors.append('The dev alias does not preserve the complete generated build manifest')
+          else:
+              print('Generated build tag and dev alias have identical manifests', flush=True)
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Dev-tag build and publishing validation\n\n')
+              summary.write(f"Dev tag: `{alias}`; source commit: `{os.environ['SOURCE_COMMIT']}`.\n\n")
+              summary.write(f"The dev tag points directly at PR #280 commit `{os.environ['PR_COMMIT']}`; the publishing workflow is maintained separately.\n\n")
+              summary.write(f'Registry image: `{image}`.\n\n')
+              summary.write('| Published tag | Verified platforms |\n| --- | --- |\n')
+              summary.write('\n'.join(rows) + '\n\n')
+              summary.write('This tests `make release-staging` using the proposed Cloud Build tool image on GitHub Actions. It does not test upstream Cloud Build IAM or the staging registry.\n\n')
+              if errors:
+                  summary.write('Verification failures:\n\n' + '\n'.join(f'- {error}' for error in errors) + '\n')
+              else:
+                  summary.write('All four image configurations are correct, and both published tags have identical four-architecture manifests.\n')
+
+          if errors:
+              for error in errors:
+                  print(f'::error::{error}', flush=True)
+              raise SystemExit(1)
+          PY
+
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          if [ -n "${DOCKER_CONFIG:-}" ]; then
+            docker logout ghcr.io || true
+            rm -rf "$DOCKER_CONFIG"
+          fi
